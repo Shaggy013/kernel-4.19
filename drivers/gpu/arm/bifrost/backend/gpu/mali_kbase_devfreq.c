@@ -34,6 +34,7 @@
 
 #include <linux/version.h>
 #include <linux/pm_opp.h>
+#include "mali_kbase_devfreq.h"
 
 #include <soc/rockchip/rockchip_ipa.h>
 #include <soc/rockchip/rockchip_opp_select.h>
@@ -56,7 +57,7 @@ static struct monitor_dev_profile mali_mdevp = {
  * This function will be called only when the opp table which is compatible with
  * "operating-points-v2-mali", is not present in the devicetree for GPU device.
  *
- * Return: Voltage value in uV, 0 in case of error.
+ * Return: Voltage value in micro volts, 0 in case of error.
  */
 static unsigned long get_voltage(struct kbase_device *kbdev, unsigned long freq)
 {
@@ -82,7 +83,7 @@ static unsigned long get_voltage(struct kbase_device *kbdev, unsigned long freq)
 	rcu_read_unlock();
 #endif
 
-	/* Return the voltage in uV. */
+	/* Return the voltage in micro volts */
 	return voltage;
 }
 

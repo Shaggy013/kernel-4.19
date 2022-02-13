@@ -1,0 +1,18 @@
+--- drivers/gpu/arm/bifrost/mali_kbase_mem.c
++++ drivers/gpu/arm/bifrost/mali_kbase_mem.c
+@@ -4605,11 +4686,10 @@ KERNEL_VERSION(4, 5, 0) > LINUX_VERSION_CODE
+ 			reg->flags & KBASE_REG_GPU_WR ? FOLL_WRITE : 0,
+ 			pages, NULL, NULL);
+ #else
+-	pinned_pages = get_user_pages_remote(mm,
+-			address,
+-			alloc->imported.user_buf.nr_pages,
+-			reg->flags & KBASE_REG_GPU_WR ? FOLL_WRITE : 0,
+-			pages, NULL, NULL);
++	pinned_pages = pin_user_pages_remote(
++		mm, address, alloc->imported.user_buf.nr_pages,
++		reg->flags & KBASE_REG_GPU_WR ? FOLL_WRITE : 0, pages, NULL,
++		NULL);
+ #endif
+ 
+ 	if (pinned_pages <= 0)

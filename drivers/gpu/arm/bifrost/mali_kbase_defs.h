@@ -71,10 +71,6 @@
 #include <linux/regulator/consumer.h>
 #include <linux/memory_group_manager.h>
 
-#if defined(CONFIG_PM_RUNTIME) || defined(CONFIG_PM)
-#define KBASE_PM_RUNTIME 1
-#endif
-
 #include "debug/mali_kbase_debug_ktrace_defs.h"
 
 /** Number of milliseconds before we time out on a GPU soft/hard reset */
@@ -111,12 +107,12 @@
 /**
  * Maximum size in bytes of a MMU lock region, as a logarithm
  */
-#define KBASE_LOCK_REGION_MAX_SIZE_LOG2 (64)
+#define KBASE_LOCK_REGION_MAX_SIZE_LOG2 (48) /*  256 TB */
 
 /**
  * Minimum size in bytes of a MMU lock region, as a logarithm
  */
-#define KBASE_LOCK_REGION_MIN_SIZE_LOG2 (15)
+#define KBASE_LOCK_REGION_MIN_SIZE_LOG2 (15) /* 32 kB */
 
 /**
  * Maximum number of GPU memory region zones
@@ -269,6 +265,21 @@ struct kbase_mmu_table {
 	struct kbase_context *kctx;
 };
 
+/**
+ * struct kbase_reg_zone - Information about GPU memory region zones
+ * @base_pfn: Page Frame Number in GPU virtual address space for the start of
+ *            the Zone
+ * @va_size_pages: Size of the Zone in pages
+ *
+ * Track information about a zone KBASE_REG_ZONE() and related macros.
+ * In future, this could also store the &rb_root that are currently in
+ * &kbase_context and &kbase_csf_device.
+ */
+struct kbase_reg_zone {
+	u64 base_pfn;
+	u64 va_size_pages;
+};
+
 #if MALI_USE_CSF
 #include "csf/mali_kbase_csf_defs.h"
 #else
@@ -363,6 +374,12 @@ struct kbase_clk_rate_trace_manager {
  * 	that some code paths keep shaders/the tiler powered whilst this is 0.
  * 	Use kbase_pm_is_active() instead to check for such cases.
  * @suspending: Flag indicating suspending/suspended
+ * @runtime_active: Flag to track if the GPU is in runtime suspended or active
+ *                  state. This ensures that runtime_put and runtime_get
+ *                  functions are called in pairs. For example if runtime_get
+ *                  has already been called from the power_on callback, then
+ *                  the call to it from runtime_gpu_active callback can be
+ *                  skipped.
  * @gpu_lost: Flag indicating gpu lost
  * 	This structure contains data for the power management framework. There
  * 	is one instance of this structure per device in the system.
@@ -388,6 +405,9 @@ struct kbase_pm_device_data {
 	struct mutex lock;
 	int active_count;
 	bool suspending;
+#if MALI_USE_CSF
+	bool runtime_active;
+#endif
 #ifdef CONFIG_MALI_ARBITER_SUPPORT
 	atomic_t gpu_lost;
 #endif /* CONFIG_MALI_ARBITER_SUPPORT */
@@ -529,8 +549,11 @@ struct kbase_devfreq_opp {
  * @entry_set_ate:    program the pte to be a valid address translation entry to
  *                    encode the physical address of the actual page being mapped.
  * @entry_set_pte:    program the pte to be a valid entry to encode the physical
- *                    address of the next lower level page table.
+ *                    address of the next lower level page table and also update
+ *                    the number of valid entries.
  * @entry_invalidate: clear out or invalidate the pte.
+ * @get_num_valid_entries: returns the number of valid entries for a specific pgd.
+ * @set_num_valid_entries: sets the number of valid entries for a specific pgd
  * @flags:            bitmask of MMU mode flags. Refer to KBASE_MMU_MODE_ constants.
  */
 struct kbase_mmu_mode {
@@ -545,8 +568,11 @@ struct kbase_mmu_mode {
 	int (*pte_is_valid)(u64 pte, int level);
 	void (*entry_set_ate)(u64 *entry, struct tagged_addr phy,
 			unsigned long flags, int level);
-	void (*entry_set_pte)(u64 *entry, phys_addr_t phy);
+	void (*entry_set_pte)(u64 *pgd, u64 vpfn, phys_addr_t phy);
 	void (*entry_invalidate)(u64 *entry);
+	unsigned int (*get_num_valid_entries)(u64 *pgd);
+	void (*set_num_valid_entries)(u64 *pgd,
+				      unsigned int num_of_valid_entries);
 	unsigned long flags;
 };
 
@@ -716,12 +742,14 @@ struct kbase_process {
  * @hwcnt.addr:            HW counter address
  * @hwcnt.addr_bytes:      HW counter size in bytes
  * @hwcnt.backend:         Kbase instrumentation backend
+ * @hwcnt_watchdog_timer:  Hardware counter watchdog interface.
  * @hwcnt_gpu_iface:       Backend interface for GPU hardware counter access.
  * @hwcnt_gpu_ctx:         Context for GPU hardware counter access.
  *                         @hwaccess_lock must be held when calling
  *                         kbase_hwcnt_context_enable() with @hwcnt_gpu_ctx.
  * @hwcnt_gpu_virt:        Virtualizer for GPU hardware counters.
  * @vinstr_ctx:            vinstr context created per device.
+ * @kinstr_prfcnt_ctx:     kinstr_prfcnt context created per device.
  * @timeline_flags:        Bitmask defining which sets of timeline tracepoints
  *                         are enabled. If zero, there is no timeline client and
  *                         therefore timeline is disabled.
@@ -738,11 +766,13 @@ struct kbase_process {
  * @reset_timeout_ms:      Number of milliseconds to wait for the soft stop to
  *                         complete for the GPU jobs before proceeding with the
  *                         GPU reset.
+ * @lowest_gpu_freq_khz:   Lowest frequency in KHz that the GPU can run at. Used
+ *                         to calculate suitable timeouts for wait operations.
  * @cache_clean_in_progress: Set when a cache clean has been started, and
  *                         cleared when it has finished. This prevents multiple
  *                         cache cleans being done simultaneously.
- * @cache_clean_queued:    Set if a cache clean is invoked while another is in
- *                         progress. If this happens, another cache clean needs
+ * @cache_clean_queued:    Pended cache clean operations invoked while another is
+ *                         in progress. If this is not 0, another cache clean needs
  *                         to be triggered immediately after completion of the
  *                         current one.
  * @cache_clean_wait:      Signalled when a cache clean has finished.
@@ -752,8 +782,6 @@ struct kbase_process {
  *                         including any contexts that might be created for
  *                         hardware counters.
  * @kctx_list_lock:        Lock protecting concurrent accesses to @kctx_list.
- * @group_max_uid_in_devices: Max value of any queue group UID in any kernel
- *                            context in the kbase device.
  * @devfreq_profile:       Describes devfreq profile for the Mali GPU device, passed
  *                         to devfreq_add_device() to add devfreq feature to Mali
  *                         GPU device.
@@ -891,6 +919,10 @@ struct kbase_process {
  * @l2_hash_override:       Used to set L2 cache hash via device tree blob
  * @l2_hash_values_override: true if @l2_hash_values is valid.
  * @l2_hash_values:         Used to set L2 asn_hash via device tree blob
+ * @sysc_alloc:             Array containing values to be programmed into
+ *                          SYSC_ALLOC[0..7] GPU registers on L2 cache
+ *                          power down. These come from either DTB or
+ *                          via DebugFS (if it is available in kernel).
  * @process_root:           rb_tree root node for maintaining a rb_tree of
  *                          kbase_process based on key tgid(thread group ID).
  * @dma_buf_root:           rb_tree root node for maintaining a rb_tree of
@@ -948,6 +980,15 @@ struct kbase_device {
 	char devname[DEVNAME_SIZE];
 	u32  id;
 
+#if IS_ENABLED(CONFIG_MALI_BIFROST_NO_MALI)
+	void *model;
+	struct kmem_cache *irq_slab;
+	struct workqueue_struct *irq_workq;
+	atomic_t serving_job_irq;
+	atomic_t serving_gpu_irq;
+	atomic_t serving_mmu_irq;
+	spinlock_t reg_op_lock;
+#endif /* CONFIG_MALI_BIFROST_NO_MALI */
 	struct kbase_pm_device_data pm;
 
 	struct kbase_mem_pool_group mem_pools;
@@ -977,6 +1018,7 @@ struct kbase_device {
 
 #if MALI_USE_CSF
 	struct kbase_hwcnt_backend_csf_if hwcnt_backend_csf_if_fw;
+	struct kbase_hwcnt_watchdog_interface hwcnt_watchdog_timer;
 #else
 	struct kbase_hwcnt {
 		spinlock_t lock;
@@ -993,6 +1035,7 @@ struct kbase_device {
 	struct kbase_hwcnt_context *hwcnt_gpu_ctx;
 	struct kbase_hwcnt_virtualizer *hwcnt_gpu_virt;
 	struct kbase_vinstr_context *vinstr_ctx;
+	struct kbase_kinstr_prfcnt_context *kinstr_prfcnt_ctx;
 
 	atomic_t               timeline_flags;
 	struct kbase_timeline *timeline;
@@ -1002,15 +1045,16 @@ struct kbase_device {
 #endif
 	u32 reset_timeout_ms;
 
+	u64 lowest_gpu_freq_khz;
+
 	bool cache_clean_in_progress;
-	bool cache_clean_queued;
+	u32 cache_clean_queued;
 	wait_queue_head_t cache_clean_wait;
 
 	void *platform_context;
 
 	struct list_head        kctx_list;
 	struct mutex            kctx_list_lock;
-	atomic_t                group_max_uid_in_devices;
 
 #ifdef CONFIG_MALI_BIFROST_DEVFREQ
 	struct devfreq_dev_profile devfreq_profile;
@@ -1131,6 +1175,8 @@ struct kbase_device {
 	bool l2_hash_values_override;
 	u32 l2_hash_values[ASN_HASH_COUNT];
 
+	u32 sysc_alloc[SYSC_ALLOC_COUNT];
+
 	struct mutex fw_load_lock;
 #if MALI_USE_CSF
 	/* CSF object for the GPU device. */
@@ -1172,6 +1218,7 @@ struct kbase_device {
 	struct priority_control_manager_device *pcm_dev;
 
 	struct notifier_block oom_notifier_block;
+
 };
 
 /**
@@ -1398,21 +1445,6 @@ struct kbase_sub_alloc {
 };
 
 /**
- * struct kbase_reg_zone - Information about GPU memory region zones
- * @base_pfn: Page Frame Number in GPU virtual address space for the start of
- *            the Zone
- * @va_size_pages: Size of the Zone in pages
- *
- * Track information about a zone KBASE_REG_ZONE() and related macros.
- * In future, this could also store the &rb_root that are currently in
- * &kbase_context
- */
-struct kbase_reg_zone {
-	u64 base_pfn;
-	u64 va_size_pages;
-};
-
-/**
  * struct kbase_context - Kernel base context
  *
  * @filp:                 Pointer to the struct file corresponding to device file
@@ -1544,6 +1576,12 @@ struct kbase_reg_zone {
  *                        pages used for GPU allocations, done for the context,
  *                        to the memory consumed by the process.
  * @gpu_va_end:           End address of the GPU va space (in 4KB page units)
+ * @running_total_tiler_heap_nr_chunks: Running total of number of chunks in all
+ *                        tiler heaps of the kbase context.
+ * @running_total_tiler_heap_memory: Running total of the tiler heap memory in the
+ *                        kbase context.
+ * @peak_total_tiler_heap_memory: Peak value of the total tiler heap memory in the
+ *                        kbase context.
  * @jit_va:               Indicates if a JIT_VA zone has been created.
  * @mem_profile_data:     Buffer containing the profiling information provided by
  *                        Userspace, can be read through the mem_profile debugfs file.
@@ -1563,25 +1601,13 @@ struct kbase_reg_zone {
  *                        of RB-tree holding currently runnable atoms on the job slot
  *                        and the head item of the linked list of atoms blocked on
  *                        cross-slot dependencies.
- * @atoms_pulled:         Total number of atoms currently pulled from the context.
- * @atoms_pulled_slot:    Per slot count of the number of atoms currently pulled
- *                        from the context.
- * @atoms_pulled_slot_pri: Per slot & priority count of the number of atoms currently
- *                        pulled from the context. hwaccess_lock shall be held when
- *                        accessing it.
- * @blocked_js:           Indicates if the context is blocked from submitting atoms
- *                        on a slot at a given priority. This is set to true, when
- *                        the atom corresponding to context is soft/hard stopped or
- *                        removed from the HEAD_NEXT register in response to
- *                        soft/hard stop.
+ * @slot_tracking:        Tracking and control of this context's use of all job
+ *                        slots
+ * @atoms_pulled_all_slots: Total number of atoms currently pulled from the
+ *                        context, across all slots.
  * @slots_pullable:       Bitmask of slots, indicating the slots for which the
  *                        context has pullable atoms in the runnable tree.
  * @work:                 Work structure used for deferred ASID assignment.
- * @legacy_hwcnt_cli:     Pointer to the legacy userspace hardware counters
- *                        client, there can be only such client per kbase
- *                        context.
- * @legacy_hwcnt_lock:    Lock used to prevent concurrent access to
- *                        @legacy_hwcnt_cli.
  * @completed_jobs:       List containing completed atoms for which base_jd_event is
  *                        to be posted.
  * @work_count:           Number of work items, corresponding to atoms, currently
@@ -1719,17 +1745,14 @@ struct kbase_context {
 	struct kbase_jd_context jctx;
 	struct jsctx_queue jsctx_queue
 		[KBASE_JS_ATOM_SCHED_PRIO_COUNT][BASE_JM_MAX_NR_SLOTS];
+	struct kbase_jsctx_slot_tracking slot_tracking[BASE_JM_MAX_NR_SLOTS];
+	atomic_t atoms_pulled_all_slots;
 
 	struct list_head completed_jobs;
 	atomic_t work_count;
 	struct timer_list soft_job_timeout;
 
-	atomic_t atoms_pulled;
-	atomic_t atoms_pulled_slot[BASE_JM_MAX_NR_SLOTS];
-	int atoms_pulled_slot_pri[BASE_JM_MAX_NR_SLOTS][
-			KBASE_JS_ATOM_SCHED_PRIO_COUNT];
 	int priority;
-	bool blocked_js[BASE_JM_MAX_NR_SLOTS][KBASE_JS_ATOM_SCHED_PRIO_COUNT];
 	s16 atoms_count[KBASE_JS_ATOM_SCHED_PRIO_COUNT];
 	u32 slots_pullable;
 	u32 age_count;
@@ -1767,6 +1790,11 @@ struct kbase_context {
 	spinlock_t         mm_update_lock;
 	struct mm_struct __rcu *process_mm;
 	u64 gpu_va_end;
+#if MALI_USE_CSF
+	u32 running_total_tiler_heap_nr_chunks;
+	u64 running_total_tiler_heap_memory;
+	u64 peak_total_tiler_heap_memory;
+#endif
 	bool jit_va;
 
 #if IS_ENABLED(CONFIG_DEBUG_FS)
@@ -1780,10 +1808,6 @@ struct kbase_context {
 	struct list_head job_fault_resume_event_list;
 
 #endif /* CONFIG_DEBUG_FS */
-
-	struct kbase_hwcnt_legacy_client *legacy_hwcnt_cli;
-	struct mutex legacy_hwcnt_lock;
-
 	struct kbase_va_region *jit_alloc[1 + BASE_JIT_ALLOC_COUNT];
 	u8 jit_max_allocations;
 	u8 jit_current_allocations;
@@ -1888,6 +1912,13 @@ enum kbase_share_attr_bits {
 	SHARE_BOTH_BITS = (2ULL << 8),	/* inner and outer shareable coherency */
 	SHARE_INNER_BITS = (3ULL << 8)	/* inner shareable coherency */
 };
+
+/**
+ * enum kbase_timeout_selector - The choice of which timeout to get scaled
+ *                               using current GPU frequency.
+ * @CSF_FIRMWARE_TIMEOUT: Response timeout from CSF firmware.
+ */
+enum kbase_timeout_selector { CSF_FIRMWARE_TIMEOUT };
 
 /**
  * kbase_device_is_cpu_coherent - Returns if the device is CPU coherent.
