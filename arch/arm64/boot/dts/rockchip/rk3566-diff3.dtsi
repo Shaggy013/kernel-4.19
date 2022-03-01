@@ -19,6 +19,23 @@
 	/delete-node/ opp-1992000000;
 };
 
+&lpddr4_params {
+	/* freq info, freq_0 is final frequency, unit: MHz */
+	freq_0 = <1056>;
+	freq_1 = <324>;
+	freq_2 = <528>;
+	freq_3 = <780>;
+};
+
+&lpddr4x_params {
+	/* freq info, freq_0 is final frequency, unit: MHz */
+	freq_0 = <1056>;
+	freq_1 = <324>;
+	freq_2 = <528>;
+	freq_3 = <780>;
+};
+
+
 &dmc {
 	system-status-freq = <
 		/*system status         freq(KHz)*/
@@ -56,6 +73,23 @@
 
 &rkisp {
 	rockchip,iq-feature = /bits/ 64 <0x3FBF7FE67FF>;
+};
+
+&rockchip_suspend {
+	status = "okay";
+
+	rockchip,sleep-debug-en = <0>;
+	rockchip,sleep-mode-config = <
+		(0
+		| RKPM_SLP_ARMOFF_LOGOFF
+		| RKPM_SLP_CENTER_OFF
+		| RKPM_SLP_HW_PLLS_OFF
+		| RKPM_SLP_PMUALIVE_32K
+		| RKPM_SLP_OSC_DIS
+		| RKPM_SLP_PMIC_LP
+		| RKPM_SLP_32K_PVTM
+		)
+	>;
 };
 
 &usbdrd_dwc3 {
