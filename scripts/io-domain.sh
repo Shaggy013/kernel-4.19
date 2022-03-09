@@ -115,7 +115,7 @@ DtsIoDomainVoltage()
 	ldo_str=$(cat $DTS_NAME  \
 		| awk 'BEGIN {RS="\n\n+";ORS="\n\n"}/regulator-name/{print $0}' \
 		| awk BEGIN{RS=EOF}'{gsub(/\n/," ");print $0}' \
-		| grep $supply \
+		| grep "$supply:" \
 		| awk '{print $2}' \
 		| awk -F 'SWITCH_REG' '{print $2}')
 
